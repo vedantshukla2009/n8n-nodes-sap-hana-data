@@ -182,6 +182,7 @@ Replace `<n8n_container>` in the commands below with your container name/ID (che
 3. Choose operation:
    - **Get All Records**: Retrieve all records from a table
    - **Get Records with Filter**: Retrieve records with WHERE conditions
+   - **Custom API Call (Custom SQL Query)**: Run a custom SQL query with optional parameters
 4. Configure table name and options
 5. Execute the node
 
@@ -196,6 +197,11 @@ Replace `<n8n_container>` in the commands below with your container name/ID (che
 - Retrieves records matching WHERE condition
 - All features from "Get All Records"
 - Flexible WHERE clause support
+
+### Custom API Call (Custom SQL Query)
+- Runs a custom SQL query (SELECT statements recommended)
+- Supports positional parameters with `?` placeholders
+- Use `LIMIT` / `OFFSET` or keyset pagination in your SQL
 
 ## Examples
 
@@ -217,6 +223,17 @@ Limit: 50
 Table Name: PRODUCTS
 Columns: ID, NAME, PRICE, CATEGORY
 Order By: PRICE DESC
+```
+
+### Custom SQL with Pagination
+```
+SQL Query: SELECT * FROM "SBO_TUEMPRESA"."JDT1" WHERE "TransId" > {{ $json.last_trans_id }} ORDER BY "TransId", "Line_ID" LIMIT {{ $json.batch_size }}
+```
+
+### Custom SQL with Parameters
+```
+SQL Query: SELECT * FROM "SBO_TUEMPRESA"."JDT1" WHERE "TransId" > ? ORDER BY "TransId", "Line_ID" LIMIT ?
+Query Parameters: 1000, 500
 ```
 
 ## Requirements

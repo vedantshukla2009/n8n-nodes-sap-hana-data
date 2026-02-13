@@ -1,5 +1,5 @@
 {
-  "name": "n8n-nodes-sap-hana-data",
+  "name": "n8n-nodes-sap-hana-2",
   "version": "1.0.2",
   "description": "N8N node for reading data from SAP HANA databases and HDI containers",
   "keywords": [
@@ -9,14 +9,14 @@
     "hdi-container"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/pondev1/n8n-nodes-sap-hana-data",
+  "homepage": "https://github.com/kleper/n8n-nodes-sap-hana-data",
   "author": {
-    "name": "Pon Murugesh Devendren",
-    "email": "pon.murugesan.d@gmail.com"
+    "name": "Kleper Roldan",
+    "email": "kleper@kleper.net"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pondev1/n8n-nodes-sap-hana-data.git"
+    "url": "git+https://github.com/kleper/n8n-nodes-sap-hana-data.git"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -7,6 +7,18 @@ import type {
 import { NodeOperationError } from 'n8n-workflow';
 import { HanaDataClient } from './utils/HanaConnection';
 
+const parseQueryParameterValue = (value: unknown): unknown => {
+	if (value === null || value === undefined) return value;
+	if (typeof value !== 'string') return value;
+	const trimmed = value.trim();
+	if (!trimmed) return value;
+	try {
+		return JSON.parse(trimmed);
+	} catch {
+		return value;
+	}
+};
+
 export class SapHanaData implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'SAP HANA Data',
@@ -14,7 +26,8 @@ export class SapHanaData implements INodeType {
 		icon: 'file:saphana.svg',
 		group: ['input'],
 		version: 1,
-		subtitle: '={{$parameter["operation"] + ": " + $parameter["tableName"]}}',
+		subtitle:
+			'={{$parameter["operation"] + ($parameter["tableName"] ? ": " + $parameter["tableName"] : "")}}',
 		description: 'Read data from SAP HANA tables and HDI containers',
 		defaults: {
 			name: 'SAP HANA Data',
@@ -48,6 +61,12 @@ export class SapHanaData implements INodeType {
 						description: 'Retrieve records with WHERE conditions',
 						action: 'Get filtered records from table',
 					},
+					{
+						name: 'Custom API Call',
+						value: 'customApiCall',
+						description: 'Run a custom SQL query with parameters and pagination',
+						action: 'Run a custom SQL query',
+					},
 				],
 				default: 'getAll',
 			},
@@ -60,6 +79,11 @@ export class SapHanaData implements INodeType {
 				default: '',
 				placeholder: 'e.g., CUSTOMERS',
 				required: true,
+				displayOptions: {
+					show: {
+						operation: ['getAll', 'getFiltered'],
+					},
+				},
 			},
 
 			// Limit field
@@ -73,6 +97,11 @@ export class SapHanaData implements INodeType {
 				typeOptions: {
 					minValue: 0,
 					maxValue: 100000,
+				},
+				displayOptions: {
+					show: {
+						operation: ['getAll', 'getFiltered'],
+					},
 				},
 			},
 
@@ -108,6 +137,56 @@ export class SapHanaData implements INodeType {
 				required: true,
 			},
 
+			{
+				displayName: 'SQL Query',
+				name: 'customQuery',
+				type: 'string',
+				default: '',
+				placeholder: 'SELECT * FROM "SBO_TUEMPRESA"."JDT1" WHERE "TransId" > ? ORDER BY "TransId", "Line_ID" LIMIT ?',
+				description:
+					'SQL query to execute. Use ? placeholders for parameters and add LIMIT or OFFSET for pagination.',
+				displayOptions: {
+					show: {
+						operation: ['customApiCall'],
+					},
+				},
+				required: true,
+			},
+
+			{
+				displayName: 'Query Parameters',
+				name: 'queryParameters',
+				type: 'fixedCollection',
+				placeholder: 'Add Parameter',
+				default: {},
+				typeOptions: {
+					multipleValues: true,
+				},
+				description: 'Parameters for ? placeholders in the query, in order',
+				displayOptions: {
+					show: {
+						operation: ['customApiCall'],
+					},
+				},
+				options: [
+					{
+						displayName: 'Parameter',
+						name: 'parameter',
+						values: [
+							{
+								displayName: 'Value',
+								name: 'value',
+								type: 'string',
+								default: '',
+								placeholder: 'e.g., 123 or "ACTIVE"',
+								description:
+									'Parameter value. JSON is supported for numbers, booleans, null, arrays, or objects.',
+							},
+						],
+					},
+				],
+			},
+
 			// Options section
 			{
 				displayName: 'Options',
@@ -115,6 +194,11 @@ export class SapHanaData implements INodeType {
 				type: 'collection',
 				placeholder: 'Add Option',
 				default: {},
+				displayOptions: {
+					show: {
+						operation: ['getAll', 'getFiltered'],
+					},
+				},
 				options: [
 					{
 						displayName: 'Columns',
@@ -162,15 +246,8 @@ export class SapHanaData implements INodeType {
 			try {
 				const operation = this.getNodeParameter('operation', i) as string;
 				const credentials = await this.getCredentials('sapHanaDataApi');
-				const tableName = this.getNodeParameter('tableName', i) as string;
-				const limit = this.getNodeParameter('limit', i, 0) as number;
 				const includeMetadata = this.getNodeParameter('includeMetadata', i, true) as boolean;
 				const returnArrayFormat = this.getNodeParameter('returnArrayFormat', i, false) as boolean;
-				const options = this.getNodeParameter('options', i, {}) as any;
-
-				// Get columns and orderBy from options
-				const columns = options.columns || '*';
-				const orderBy = options.orderBy || '';
 
 				const client = new HanaDataClient(credentials);
 
@@ -184,6 +261,16 @@ export class SapHanaData implements INodeType {
 					// Execute based on operation
 					switch (operation) {
 						case 'getAll': {
+							const tableName = this.getNodeParameter('tableName', i) as string;
+							const limit = this.getNodeParameter('limit', i, 0) as number;
+							const options = this.getNodeParameter('options', i, {}) as {
+								columns?: string;
+								orderBy?: string;
+							};
+
+							const columns = options.columns || '*';
+							const orderBy = options.orderBy || '';
+
 							if (orderBy || limit > 0) {
 								results = await client.getFilteredRecords(
 									tableName, 
@@ -207,6 +294,14 @@ export class SapHanaData implements INodeType {
 						}
 
 						case 'getFiltered': {
+							const tableName = this.getNodeParameter('tableName', i) as string;
+							const limit = this.getNodeParameter('limit', i, 0) as number;
+							const options = this.getNodeParameter('options', i, {}) as {
+								columns?: string;
+								orderBy?: string;
+							};
+							const columns = options.columns || '*';
+							const orderBy = options.orderBy || '';
 							const whereCondition = this.getNodeParameter('whereCondition', i) as string;
 
 							results = await client.getFilteredRecords(
@@ -224,6 +319,29 @@ export class SapHanaData implements INodeType {
 								columns,
 								orderBy,
 								limit: limit > 0 ? limit : null,
+							};
+							break;
+						}
+
+						case 'customApiCall': {
+							const query = this.getNodeParameter('customQuery', i) as string;
+							if (!query.trim()) {
+								throw new NodeOperationError(this.getNode(), 'SQL query is required', { itemIndex: i });
+							}
+
+							const queryParameters = this.getNodeParameter('queryParameters', i, {}) as {
+								parameter?: Array<{ value: unknown }>;
+							};
+							const params = (queryParameters.parameter ?? []).map((param) =>
+								parseQueryParameterValue(param.value),
+							);
+
+							results = await client.executeCustomQuery(query, params);
+
+							queryInfo = {
+								operation: 'customApiCall',
+								query,
+								parameterCount: params.length || null,
 							};
 							break;
 						}
