@@ -1,0 +1,86 @@
+name: hana-local
+x-n8n: &n8n
+  image: hana-local:2.29.8
+  pull_policy: never
+  restart: unless-stopped
+  environment:
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: postgres
+    DB_POSTGRESDB_DATABASE: n8n
+    DB_POSTGRESDB_USER: n8n
+    DB_POSTGRESDB_PASSWORD: ${LOCAL_DB_PASSWORD:?Local environment file required}
+    N8N_ENCRYPTION_KEY: ${LOCAL_ENCRYPTION_KEY:?Local environment file required}
+    EXECUTIONS_MODE: queue
+    QUEUE_BULL_REDIS_HOST: redis
+    N8N_CONCURRENCY_PRODUCTION_LIMIT: 10
+    N8N_COMMUNITY_PACKAGES_ENABLED: 'true'
+    N8N_SECURE_COOKIE: 'false'
+    N8N_DIAGNOSTICS_ENABLED: 'false'
+    N8N_VERSION_NOTIFICATIONS_ENABLED: 'false'
+    N8N_HOST: localhost
+    N8N_PROTOCOL: http
+    WEBHOOK_URL: http://localhost:15678/
+    N8N_EDITOR_BASE_URL: http://localhost:15678/
+  volumes:
+    - nodes:/home/node/.n8n/nodes
+services:
+  install-package:
+    image: hana-local:2.29.8
+    build:
+      context: ../..
+      dockerfile: docker/local/Dockerfile
+    user: root
+    entrypoint: ['node', '-e']
+    command:
+      - "const f=require('fs');const p='/target/node_modules/n8n-nodes-sap-hana-2';f.rmSync(p,{recursive:true,force:true});f.mkdirSync(p,{recursive:true});f.cpSync('/opt/hana',p,{recursive:true,verbatimSymlinks:true});f.writeFileSync('/target/package.json',JSON.stringify({name:'installed-nodes',private:true,dependencies:{'n8n-nodes-sap-hana-2':'1.0.3'}}));function own(p){f.lchownSync(p,1000,1000);if(f.lstatSync(p).isDirectory())for(const x of f.readdirSync(p))own(p+'/'+x)}own('/target');console.log('Installed local SAP HANA community package')"
+    volumes: [nodes:/target]
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: n8n
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD}
+    volumes: [database:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U n8n -d n8n']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:6-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes: [redis:/data]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  n8n:
+    <<: *n8n
+    ports: ['127.0.0.1:15678:5678']
+    volumes:
+      - home:/home/node/.n8n
+      - nodes:/home/node/.n8n/nodes
+    depends_on:
+      install-package: {condition: service_completed_successfully}
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:5678/healthz/readiness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))']
+      interval: 3s
+      timeout: 3s
+      retries: 60
+  worker:
+    <<: *n8n
+    command: ['worker', '--concurrency=10']
+    deploy:
+      replicas: 3
+    depends_on:
+      n8n: {condition: service_healthy}
+volumes:
+  database:
+  redis:
+  home:
+  nodes:

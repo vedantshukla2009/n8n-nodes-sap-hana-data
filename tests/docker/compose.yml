@@ -1,0 +1,64 @@
+name: hana-pool-test
+x-n8n: &n8n
+  image: hana-pool-test:${N8N_VERSION:-2.29.8}
+  environment: &environment
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: postgres
+    DB_POSTGRESDB_DATABASE: n8n_test
+    DB_POSTGRESDB_USER: n8n_test
+    DB_POSTGRESDB_PASSWORD: isolated-test-only
+    EXECUTIONS_MODE: queue
+    QUEUE_BULL_REDIS_HOST: redis
+    N8N_ENCRYPTION_KEY: isolated-local-test-key-not-for-production
+    N8N_DIAGNOSTICS_ENABLED: 'false'
+    N8N_VERSION_NOTIFICATIONS_ENABLED: 'false'
+    N8N_PERSONALIZATION_ENABLED: 'false'
+    N8N_SECURE_COOKIE: 'false'
+    N8N_LOG_LEVEL: debug
+    N8N_RUNNERS_ENABLED: 'false'
+    N8N_CONCURRENCY_PRODUCTION_LIMIT: 10
+    WEBHOOK_URL: http://localhost:15678/
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: n8n_test
+      POSTGRES_USER: n8n_test
+      POSTGRES_PASSWORD: isolated-test-only
+    tmpfs: /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U n8n_test -d n8n_test']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:6-alpine
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  n8n:
+    <<: *n8n
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile
+      args:
+        N8N_VERSION: ${N8N_VERSION:-2.29.8}
+    ports: ['127.0.0.1:15678:5678']
+    healthcheck:
+      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:5678/healthz/readiness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))']
+      interval: 2s
+      timeout: 3s
+      retries: 60
+  worker:
+    <<: *n8n
+    command: ['worker', '--concurrency=10']
+    depends_on:
+      n8n:
+        condition: service_healthy

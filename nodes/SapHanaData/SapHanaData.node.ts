@@ -1,11 +1,13 @@
 import type {
 	IExecuteFunctions,
+	IDataObject,
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
 } from 'n8n-workflow';
 import { NodeOperationError } from 'n8n-workflow';
-import { HanaDataClient } from './utils/HanaConnection';
+import { HanaDataClient, HanaQueryResult } from './utils/HanaConnection';
+import { PooledHanaDataClient } from './utils/PooledHanaConnection';
 
 const parseQueryParameterValue = (value: unknown): unknown => {
 	if (value === null || value === undefined) return value;
@@ -64,7 +66,8 @@ export class SapHanaData implements INodeType {
 					{
 						name: 'Custom API Call',
 						value: 'customApiCall',
-						description: 'Run a custom SQL query with parameters and pagination',
+						description:
+							'Run a custom SQL query with parameters and pagination',
 						action: 'Run a custom SQL query',
 					},
 				],
@@ -118,7 +121,8 @@ export class SapHanaData implements INodeType {
 				name: 'returnArrayFormat',
 				type: 'boolean',
 				default: false,
-				description: 'Whether to return all rows as a single item with a data array',
+				description:
+					'Whether to return all rows as a single item with a data array',
 			},
 
 			// WHERE condition for filtered queries
@@ -127,7 +131,7 @@ export class SapHanaData implements INodeType {
 				name: 'whereCondition',
 				type: 'string',
 				default: '',
-				placeholder: 'e.g., STATUS = \'ACTIVE\' AND CREATED_DATE > \'2024-01-01\'',
+				placeholder: "e.g., STATUS = 'ACTIVE' AND CREATED_DATE > '2024-01-01'",
 				description: 'WHERE clause condition (without the WHERE keyword)',
 				displayOptions: {
 					show: {
@@ -142,9 +146,10 @@ export class SapHanaData implements INodeType {
 				name: 'customQuery',
 				type: 'string',
 				default: '',
-				placeholder: 'SELECT * FROM "SBO_TUEMPRESA"."JDT1" WHERE "TransId" > ? ORDER BY "TransId", "Line_ID" LIMIT ?',
+				placeholder:
+					'SELECT * FROM "SBO_TUEMPRESA"."JDT1" WHERE "TransId" > ? ORDER BY "TransId", "Line_ID" LIMIT ?',
 				description:
-					'SQL query to execute. Use ? placeholders for parameters and add LIMIT or OFFSET for pagination.',
+					'SQL to execute, including CALL statements. Use ? placeholders; for procedures, supply values only for IN and INOUT parameters.',
 				displayOptions: {
 					show: {
 						operation: ['customApiCall'],
@@ -162,7 +167,8 @@ export class SapHanaData implements INodeType {
 				typeOptions: {
 					multipleValues: true,
 				},
-				description: 'Parameters for ? placeholders in the query, in order',
+				description:
+					'Input values for ? placeholders, in order. For CALL, omit values for OUT parameters.',
 				displayOptions: {
 					show: {
 						operation: ['customApiCall'],
@@ -187,6 +193,25 @@ export class SapHanaData implements INodeType {
 				],
 			},
 
+			{
+				displayName: 'Use Fresh Connection',
+				name: 'freshConnection',
+				type: 'boolean',
+				default: true,
+				displayOptions: { show: { operation: ['customApiCall'] } },
+				description:
+					'Whether to open and close a dedicated connection for this SQL. Disable to use credential pooling only when the SQL or procedure leaves no temporary objects or persistent session state.',
+			},
+			{
+				displayName: 'Query Timeout (Seconds)',
+				name: 'queryTimeout',
+				type: 'number',
+				default: 0,
+				typeOptions: { minValue: 0 },
+				description:
+					'Maximum time for preparation and execution of each SQL statement. Zero disables the query deadline. A timeout closes the connection without retrying the statement.',
+			},
+
 			// Options section
 			{
 				displayName: 'Options',
@@ -206,7 +231,8 @@ export class SapHanaData implements INodeType {
 						type: 'string',
 						default: '*',
 						placeholder: 'e.g., ID, NAME, EMAIL or * for all columns',
-						description: 'Comma-separated list of columns to retrieve, or * for all columns',
+						description:
+							'Comma-separated list of columns to retrieve, or * for all columns',
 					},
 					{
 						displayName: 'Order By',
@@ -228,7 +254,8 @@ export class SapHanaData implements INodeType {
 				typeOptions: {
 					theme: 'info',
 				},
-				description: '💡 Ensure your HANA user has SELECT permissions on the target tables. For HDI containers, use the schema from your service key.',
+				description:
+					'💡 Ensure your HANA user has SELECT permissions on the target tables. For HDI containers, use the schema from your service key.',
 			},
 		],
 	};
@@ -236,6 +263,7 @@ export class SapHanaData implements INodeType {
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const items = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
+		const signal = this.getExecutionCancelSignal?.();
 
 		// Validate input items
 		if (!items || items.length === 0) {
@@ -243,16 +271,62 @@ export class SapHanaData implements INodeType {
 		}
 
 		for (let i = 0; i < items.length; i++) {
+			const outputStart = returnData.length;
 			try {
 				const operation = this.getNodeParameter('operation', i) as string;
 				const credentials = await this.getCredentials('sapHanaDataApi');
-				const includeMetadata = this.getNodeParameter('includeMetadata', i, true) as boolean;
-				const returnArrayFormat = this.getNodeParameter('returnArrayFormat', i, false) as boolean;
+				const includeMetadata = this.getNodeParameter(
+					'includeMetadata',
+					i,
+					true,
+				) as boolean;
+				const returnArrayFormat = this.getNodeParameter(
+					'returnArrayFormat',
+					i,
+					false,
+				) as boolean;
 
-				const client = new HanaDataClient(credentials);
+				const queryTimeout = this.getNodeParameter(
+					'queryTimeout',
+					i,
+					0,
+				) as number;
+				if (
+					!Number.isFinite(queryTimeout) ||
+					queryTimeout < 0 ||
+					queryTimeout * 1000 > 2147483647
+				) {
+					throw new NodeOperationError(
+						this.getNode(),
+						'Query timeout must be a non-negative number no greater than 2147483 seconds',
+						{ itemIndex: i },
+					);
+				}
+				const executionOptions = {
+					signal,
+					queryTimeoutMs: queryTimeout * 1000,
+				};
+				const fresh = this.getNodeParameter(
+					'freshConnection',
+					i,
+					true,
+				) as boolean;
+				const pooled =
+					credentials.pooling === true &&
+					!(operation === 'customApiCall' && fresh);
+				const client = pooled
+					? new PooledHanaDataClient(
+							credentials,
+							this.getNode().credentials?.sapHanaDataApi?.id ?? '',
+							executionOptions,
+						)
+					: new HanaDataClient(credentials, executionOptions);
 
-				let results: any[] = [];
-				let queryInfo: any = {};
+				let results: IDataObject[] = [];
+				let queryInfo: IDataObject = {};
+				let customResult: HanaQueryResult | undefined;
+				let operationFailed = false;
+				let cleanupFailure: unknown;
 
 				try {
 					// Connect to HANA
@@ -273,11 +347,11 @@ export class SapHanaData implements INodeType {
 
 							if (orderBy || limit > 0) {
 								results = await client.getFilteredRecords(
-									tableName, 
+									tableName,
 									'1=1', // Always true condition
-									columns, 
-									orderBy || undefined, 
-									limit > 0 ? limit : undefined
+									columns,
+									orderBy || undefined,
+									limit > 0 ? limit : undefined,
 								);
 							} else {
 								results = await client.getAllRecords(tableName, columns);
@@ -302,14 +376,17 @@ export class SapHanaData implements INodeType {
 							};
 							const columns = options.columns || '*';
 							const orderBy = options.orderBy || '';
-							const whereCondition = this.getNodeParameter('whereCondition', i) as string;
+							const whereCondition = this.getNodeParameter(
+								'whereCondition',
+								i,
+							) as string;
 
 							results = await client.getFilteredRecords(
 								tableName,
 								whereCondition,
 								columns,
 								orderBy || undefined,
-								limit > 0 ? limit : undefined
+								limit > 0 ? limit : undefined,
 							);
 
 							queryInfo = {
@@ -326,17 +403,28 @@ export class SapHanaData implements INodeType {
 						case 'customApiCall': {
 							const query = this.getNodeParameter('customQuery', i) as string;
 							if (!query.trim()) {
-								throw new NodeOperationError(this.getNode(), 'SQL query is required', { itemIndex: i });
+								throw new NodeOperationError(
+									this.getNode(),
+									'SQL query is required',
+									{
+										itemIndex: i,
+									},
+								);
 							}
 
-							const queryParameters = this.getNodeParameter('queryParameters', i, {}) as {
+							const queryParameters = this.getNodeParameter(
+								'queryParameters',
+								i,
+								{},
+							) as {
 								parameter?: Array<{ value: unknown }>;
 							};
 							const params = (queryParameters.parameter ?? []).map((param) =>
 								parseQueryParameterValue(param.value),
 							);
 
-							results = await client.executeCustomQuery(query, params);
+							customResult = await client.executeCustomQuery(query, params);
+							if (customResult.kind === 'rows') results = customResult.rows;
 
 							queryInfo = {
 								operation: 'customApiCall',
@@ -350,12 +438,32 @@ export class SapHanaData implements INodeType {
 							throw new NodeOperationError(
 								this.getNode(),
 								`Unknown operation: ${operation}`,
-								{ itemIndex: i }
+								{
+									itemIndex: i,
+								},
 							);
 					}
 
 					// Format output based on options
-					if (returnArrayFormat) {
+					if (customResult && customResult.kind !== 'rows') {
+						const json: IDataObject = { success: true };
+						if (customResult.kind === 'procedure') {
+							json.outputParameters = customResult.outputParameters;
+							json.resultSets = customResult.resultSets;
+							json.rowCount = customResult.resultSets.reduce(
+								(count, rows) => count + rows.length,
+								0,
+							);
+						} else if (customResult.affectedRows !== undefined) {
+							json.affectedRows = customResult.affectedRows;
+						}
+						if (includeMetadata)
+							json.metadata = {
+								...queryInfo,
+								timestamp: new Date().toISOString(),
+							};
+						returnData.push({ json, pairedItem: { item: i } });
+					} else if (returnArrayFormat) {
 						// Return as single item with array
 						const outputItem: INodeExecutionData = {
 							json: {
@@ -412,13 +520,29 @@ export class SapHanaData implements INodeType {
 							}
 						}
 					}
-
+				} catch (error) {
+					operationFailed = true;
+					throw error;
 				} finally {
-					// Always disconnect
-					await client.disconnect();
+					try {
+						await client.disconnect();
+					} catch (cleanupError) {
+						// Do not replace the original SQL error with a secondary cleanup failure.
+						if (!operationFailed) cleanupFailure = cleanupError;
+					}
 				}
-
-			} catch (error: any) {
+				if (cleanupFailure) throw cleanupFailure;
+			} catch (cause) {
+				returnData.splice(outputStart);
+				const error = cause instanceof Error ? cause : new Error(String(cause));
+				if (signal?.aborted)
+					throw new NodeOperationError(
+						this.getNode(),
+						'SAP HANA execution cancelled',
+						{
+							itemIndex: i,
+						},
+					);
 				if (this.continueOnFail()) {
 					const errorResult: INodeExecutionData = {
 						json: {
@@ -437,7 +561,7 @@ export class SapHanaData implements INodeType {
 					throw new NodeOperationError(
 						this.getNode(),
 						`SAP HANA Read operation failed: ${error.message}`,
-						{ itemIndex: i }
+						{ itemIndex: i },
 					);
 				}
 			}
